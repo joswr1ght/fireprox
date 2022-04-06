@@ -3,7 +3,6 @@ from multiprocessing import Pool
 from pathlib import Path
 import shutil
 import tldextract
-import boto3
 import os
 import sys
 import datetime
@@ -12,6 +11,10 @@ import argparse
 import json
 import configparser
 from typing import Tuple, Callable
+import string
+import random
+import docker
+import time
 
 
 class FireProx(object):
@@ -28,6 +31,9 @@ class FireProx(object):
         self.client = None
         self.help = help_text
 
+        if (self.region == None):
+            self.region = 'us-east-1'
+
         if self.access_key and self.secret_access_key:
             if not self.region:
                 self.error('Please provide a region with AWS credentials')
@@ -38,27 +44,20 @@ class FireProx(object):
         if not self.command:
             self.error('Please provide a valid command')
 
+
     def __str__(self):
         return 'FireProx()'
+
 
     def _try_instance_profile(self) -> bool:
         """Try instance profile credentials
 
         :return:
         """
-        try:
-            if not self.region:
-                self.client = boto3.client('apigateway')
-            else:
-                self.client = boto3.client(
-                    'apigateway',
-                    region_name=self.region
-                )
-            self.client.get_account()
-            self.region = self.client._client_config.region_name
-            return True
-        except:
-            return False
+        # This is all hack to simulate AWS access without actual AWS; remove
+        # calls to boto3.*
+        return True
+
 
     def load_creds(self) -> bool:
         """Load credentials from AWS config and credentials files if present.
@@ -81,25 +80,15 @@ class FireProx(object):
                 return False
             self.region = config[config_profile_section].get('region', 'us-east-1')
             try:
-                self.client = boto3.session.Session(profile_name=self.profile_name,
-                        region_name=self.region).client('apigateway')
-                self.client.get_account()
+#                self.client = boto3.session.Session(profile_name=self.profile_name,
+#                        region_name=self.region).client('apigateway')
+#                self.client.get_account()
                 return True
             except:
                 pass
         # Maybe had profile, maybe didn't
         if self.access_key and self.secret_access_key:
             try:
-                self.client = boto3.client(
-                    'apigateway',
-                    aws_access_key_id=self.access_key,
-                    aws_secret_access_key=self.secret_access_key,
-                    aws_session_token=self.session_token,
-                    region_name=self.region
-                )
-                self.client.get_account()
-                self.region = self.client._client_config.region_name
-                # Save/overwrite config if profile specified
                 if self.profile_name:
                     if config_profile_section not in config:
                         config.add_section(config_profile_section)
@@ -122,118 +111,61 @@ class FireProx(object):
         else:
             return False
 
+
     def error(self, error):
         print(self.help)
         sys.exit(error)
 
-    def get_template(self):
-        url = self.url
-        if url[-1] == '/':
-            url = url[:-1]
 
-        title = 'fireprox_{}'.format(
-            tldextract.extract(url).domain
-        )
-        version_date = f'{datetime.datetime.now():%Y-%m-%dT%XZ}'
-        template = '''
-        {
-          "swagger": "2.0",
-          "info": {
-            "version": "{{version_date}}",
-            "title": "{{title}}"
-          },
-          "basePath": "/",
-          "schemes": [
-            "https"
-          ],
-          "paths": {
-            "/": {
-              "get": {
-                "parameters": [
-                  {
-                    "name": "proxy",
-                    "in": "path",
-                    "required": true,
-                    "type": "string"
-                  },
-                  {
-                    "name": "X-My-X-Forwarded-For",
-                    "in": "header",
-                    "required": false,
-                    "type": "string"
-                  }
-                ],
-                "responses": {},
-                "x-amazon-apigateway-integration": {
-                  "uri": "{{url}}/",
-                  "responses": {
-                    "default": {
-                      "statusCode": "200"
-                    }
-                  },
-                  "requestParameters": {
-                    "integration.request.path.proxy": "method.request.path.proxy",
-                    "integration.request.header.X-Forwarded-For": "method.request.header.X-My-X-Forwarded-For"
-                  },
-                  "passthroughBehavior": "when_no_match",
-                  "httpMethod": "ANY",
-                  "cacheNamespace": "irx7tm",
-                  "cacheKeyParameters": [
-                    "method.request.path.proxy"
-                  ],
-                  "type": "http_proxy"
-                }
-              }
-            },
-            "/{proxy+}": {
-              "x-amazon-apigateway-any-method": {
-                "produces": [
-                  "application/json"
-                ],
-                "parameters": [
-                  {
-                    "name": "proxy",
-                    "in": "path",
-                    "required": true,
-                    "type": "string"
-                  },
-                  {
-                    "name": "X-My-X-Forwarded-For",
-                    "in": "header",
-                    "required": false,
-                    "type": "string"
-                  }
-                ],
-                "responses": {},
-                "x-amazon-apigateway-integration": {
-                  "uri": "{{url}}/{proxy}",
-                  "responses": {
-                    "default": {
-                      "statusCode": "200"
-                    }
-                  },
-                  "requestParameters": {
-                    "integration.request.path.proxy": "method.request.path.proxy",
-                    "integration.request.header.X-Forwarded-For": "method.request.header.X-My-X-Forwarded-For"
-                  },
-                  "passthroughBehavior": "when_no_match",
-                  "httpMethod": "ANY",
-                  "cacheNamespace": "irx7tm",
-                  "cacheKeyParameters": [
-                    "method.request.path.proxy"
-                  ],
-                  "type": "http_proxy"
-                }
-              }
-            }
-          }
-        }
+    def _generate_app_id(self):
+        return ''.join(random.choice(string.ascii_lowercase + string.digits) for i in range(10))
+
+
+    def _get_container_ip(self, container, networkname=None):
         '''
-        template = template.replace('{{url}}', url)
-        template = template.replace('{{title}}', title)
-        template = template.replace('{{version_date}}', version_date)
+        Get the IP address of the specified docker.models.containers.Container object.
+        Use the specified networkname, otherwise return the first IP address.
+        Return None for network name not found or no IP address.
+        '''
+        network=container.attrs['NetworkSettings']['Networks']
+        if (networkname != None):
+            ipaddress = network[networkname]['IPAddress']
+            if (ipaddress):
+                return ipaddress
+        else:
+            # Return the IP address for the first network found
+            ip = None
+            for netkey in network:
+                ipaddress = network[netkey]['IPAddress']
+                if (ipaddress):
+                    return ipaddress
 
-        return str.encode(template)
+        return None
+
+
+    def _add_hosts(self, container, networkname=None):
+        '''
+        Add the docker.models.containers.Container hostname and IP address to /etc/hosts.
+        '''
+        hostname = container.attrs['Config']['Hostname']
+        ip = self._get_container_ip(container, networkname)
+        with open('/etc/hosts', 'a') as hostsf:
+            hostsf.write(f'{ip} {hostname}\n')
+
+
+    def _remove_hosts(self, container):
+        '''
+        Remove the dockers.models.containers.Container hostname from /etc/hosts.
+        '''
+        hostname = container.attrs['Config']['Hostname']
+        hosts = []
+        with open('/etc/hosts', 'r') as hostsf:
+            for line in hostsf.readlines():
+                if (hostname not in line):
+                    hosts.append(line)
+        with open('/etc/hosts', 'w') as hostsf:
+            hostsf.write(''.join(hosts))
+
 
     def create_api(self, url):
         if not url:
@@ -241,84 +173,93 @@ class FireProx(object):
 
         print(f'Creating => {url}...')
 
-        template = self.get_template()
-        response = self.client.import_rest_api(
-            parameters={
-                'endpointConfigurationTypes': 'REGIONAL'
-            },
-            body=template
-        )
-        resource_id, proxy_url = self.create_deployment(response['id'])
-        self.store_api(
-            response['id'],
-            response['name'],
-            response['createdDate'],
-            response['version'],
-            url,
-            resource_id,
-            proxy_url
-        )
+        # Create the fake API endpoint by launching a Docker container
+        client = docker.from_env()
+        app_id = self._generate_app_id()
+        region = self.region
+        # Unlike the real fireprox, we only take a hostname argument
+        target=url.split('/')[2]
+        self._containername = f'{app_id}.execute-api.{region}.amazonaws.com'
+
+        container = client.containers.run('execute-api.amazonaws.com',
+                detach=True,  # -d
+                privileged=True,  # --privileged
+                network='sec504cloudsim-far',  # --net
+                remove=True,  # --rm
+                init=True,  # --init
+                environment={'JWAPIGW_TARGET':target},  # -e
+                hostname=self._containername,  # -h
+                stdin_open=True,  # -i
+                tty=True,  # -t
+                name=self._containername)  # --name
+        self._containerid = container.id
+
+        # Give container time to start up
+        while self._get_container_ip(container, 'sec504cloudsim-far') == None:
+            time.sleep(1)
+            container.reload()
+
+        # We need this hack for Docker routing to work back to the host system
+        container.exec_run('ip route del default')
+        container.exec_run('ip route add default via 10.200.0.2')
+
+        # Save hostname to local /etc/hosts file
+        self._add_hosts(container, 'sec504cloudsim-far')
+
+        self._print_list([container,])
+
+    def _print_list(self, containers):
+        '''
+        Accept a list of Containers, and print a line of status for each.
+        Displays only containers matching the FireProx naming convention.
+        Intended to be called using client.containers.list() or with a single
+        Container object.
+        '''
+        for container in containers:
+            containername = container.name
+            if ('execute-api' not in containername or 'amazonaws.com' not in containername):
+                continue
+            app_id = containername.split('.')[0]
+            url = 'http://' + container.attrs['Config']['Env'][0].split('=')[1] # Whole lot of assumptions here
+            # This is what we get from Docker --  2022-04-06T12:47:31.747842357Z
+            # This is what we want to match for FireProx -- [2022-04-03 07:34:41-04:00]
+            timestamp = container.attrs['Created']
+            day, time_ = timestamp.split('T')
+            time_ = time_.split('.')[0] + '-00:00'
+            domain = tldextract.extract(url).domain
+
+            print(f'[{day} {time_}] ({app_id}) fireprox_{domain} => http://{containername}/ ({url})')
+
 
     def update_api(self, api_id, url):
-        if not any([api_id, url]):
-            self.error('Please provide a valid API ID and URL end-point')
+        self.error('Not implemented (for this lab exercise)')
 
-        if url[-1] == '/':
-            url = url[:-1]
-
-        resource_id = self.get_resource(api_id)
-        if resource_id:
-            print(f'Found resource {resource_id} for {api_id}!')
-            response = self.client.update_integration(
-                restApiId=api_id,
-                resourceId=resource_id,
-                httpMethod='ANY',
-                patchOperations=[
-                    {
-                        'op': 'replace',
-                        'path': '/uri',
-                        'value': '{}/{}'.format(url, r'{proxy}'),
-                    },
-                ]
-            )
-            return response['uri'].replace('/{proxy}', '') == url
-        else:
-            self.error(f'Unable to update, no valid resource for {api_id}')
 
     def delete_api(self, api_id):
         if not api_id:
             self.error('Please provide a valid API ID')
-        items = self.list_api(api_id)
-        for item in items:
-            item_api_id = item['id']
-            if item_api_id == api_id:
-                response = self.client.delete_rest_api(
-                    restApiId=api_id
-                )
+        client = docker.from_env()
+        for container in client.containers.list():
+            if (api_id in container.name):
+                # Stop this container
+                container.stop()
+                # Remove /etc/hosts entry
+                self._remove_hosts(container)
                 return True
         return False
 
-    def list_api(self, deleted_api_id=None):
-        response = self.client.get_rest_apis()
-        for item in response['items']:
-            try:
-                created_dt = item['createdDate']
-                api_id = item['id']
-                name = item['name']
-                proxy_url = self.get_integration(api_id).replace('{proxy}', '')
-                url = f'https://{api_id}.execute-api.{self.region}.amazonaws.com/fireprox/'
-                if not api_id == deleted_api_id:
-                    print(f'[{created_dt}] ({api_id}) {name}: {url} => {proxy_url}')
-            except:
-                pass
 
-        return response['items']
+    def list_api(self, deleted_api_id=None):
+        client = docker.from_env()
+        self._print_list(client.containers.list())
+
 
     def store_api(self, api_id, name, created_dt, version_dt, url,
                   resource_id, proxy_url):
         print(
             f'[{created_dt}] ({api_id}) {name} => {proxy_url} ({url})'
         )
+
 
     def create_deployment(self, api_id):
         if not api_id:
@@ -334,6 +275,7 @@ class FireProx(object):
         return (resource_id,
                 f'https://{api_id}.execute-api.{self.region}.amazonaws.com/fireprox/')
 
+
     def get_resource(self, api_id):
         if not api_id:
             self.error('Please provide a valid API ID')
@@ -345,6 +287,7 @@ class FireProx(object):
             if item_path == '/{proxy+}':
                 return item_id
         return None
+
 
     def get_integration(self, api_id):
         if not api_id:
@@ -388,6 +331,15 @@ def main():
 
     :return:
     """
+
+    print('''FireProx - Modified for lab use. Do not use this version outside of a lab. To
+use FireProx in production on this system, run /opt/fireprox/fire.py instead.
+''')
+
+    if os.geteuid() != 0:
+        sys.stderr.write('This lab version of FireProx requires root access. Please run with sudo.\n')
+        sys.exit(1)
+
     args, help_text = parse_arguments()
     fp = FireProx(args, help_text)
     if args.command == 'list':
@@ -407,11 +359,6 @@ def main():
         result = fp.update_api(fp.api_id, fp.url)
         success = 'Success!' if result else 'Failed!'
         print(f'API Update Complete: {success}')
-
-    else:
-        print(f'[ERROR] Unsupported command: {args.command}\n')
-        print(help_text)
-        sys.exit(1)
 
 
 if __name__ == '__main__':
